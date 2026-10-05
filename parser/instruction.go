@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/t14raptor/go-fwasm/instruction"
 	"github.com/t14raptor/go-fwasm/types"
@@ -25,24 +26,8 @@ func parseExpression(r *Reader) ([]instruction.Instruction, error) {
 		if result.isEnd {
 			break
 		}
-
-		instrs = append(instrs, result.instr)
-	}
-
-	return instrs, nil
-}
-
-func parseInstructions(r *Reader) ([]instruction.Instruction, error) {
-	var instrs []instruction.Instruction
-
-	for !r.EOF() {
-		result, err := parseInstructionInternal(r)
-		if err != nil {
-			return nil, err
-		}
-
-		if result.isEnd {
-			continue
+		if result.isElse {
+			return nil, fmt.Errorf("%w: else outside if", ErrInvalidOpcode)
 		}
 
 		instrs = append(instrs, result.instr)
@@ -162,11 +147,11 @@ func parseInstructionInternal(r *Reader) (parseResult, error) {
 
 	// Reference instructions
 	case instruction.OpRefNull:
-		refType, err := r.ReadByte()
+		refType, err := readRefType(r)
 		if err != nil {
 			return parseResult{}, err
 		}
-		return ref(instruction.RefNull{Type: types.ValueType(refType)}), nil
+		return ref(instruction.RefNull{Type: refType}), nil
 
 	case instruction.OpRefIsNull:
 		return ref(instruction.RefIsNull{}), nil
@@ -405,18 +390,16 @@ func parseInstructionInternal(r *Reader) (parseResult, error) {
 		return mem(instruction.I64Store32{MemArg: memArg}), nil
 
 	case instruction.OpMemorySize:
-		memIdx, err := r.ReadByte()
-		if err != nil {
+		if err := readZeroByte(r); err != nil {
 			return parseResult{}, err
 		}
-		return mem(instruction.MemorySize{MemIdx: uint32(memIdx)}), nil
+		return mem(instruction.MemorySize{}), nil
 
 	case instruction.OpMemoryGrow:
-		memIdx, err := r.ReadByte()
-		if err != nil {
+		if err := readZeroByte(r); err != nil {
 			return parseResult{}, err
 		}
-		return mem(instruction.MemoryGrow{MemIdx: uint32(memIdx)}), nil
+		return mem(instruction.MemoryGrow{}), nil
 
 	// Numeric constants
 	case instruction.OpI32Const:
@@ -761,36 +744,34 @@ func parseExtendedInstruction(r *Reader) (parseResult, error) {
 		if err != nil {
 			return parseResult{}, err
 		}
-		memIdx, err := r.ReadByte()
-		if err != nil {
+		if err := readZeroByte(r); err != nil {
 			return parseResult{}, err
 		}
-		return mem(instruction.MemoryInit{DataIdx: dataIdx, MemIdx: uint32(memIdx)}), nil
+		r.usesDataIdx = true
+		return mem(instruction.MemoryInit{DataIdx: dataIdx}), nil
 
 	case instruction.ExtOpDataDrop:
 		dataIdx, err := r.ReadU32()
 		if err != nil {
 			return parseResult{}, err
 		}
+		r.usesDataIdx = true
 		return mem(instruction.DataDrop{DataIdx: dataIdx}), nil
 
 	case instruction.ExtOpMemoryCopy:
-		dstMemIdx, err := r.ReadByte()
-		if err != nil {
+		if err := readZeroByte(r); err != nil {
 			return parseResult{}, err
 		}
-		srcMemIdx, err := r.ReadByte()
-		if err != nil {
+		if err := readZeroByte(r); err != nil {
 			return parseResult{}, err
 		}
-		return mem(instruction.MemoryCopy{DstMemIdx: uint32(dstMemIdx), SrcMemIdx: uint32(srcMemIdx)}), nil
+		return mem(instruction.MemoryCopy{}), nil
 
 	case instruction.ExtOpMemoryFill:
-		memIdx, err := r.ReadByte()
-		if err != nil {
+		if err := readZeroByte(r); err != nil {
 			return parseResult{}, err
 		}
-		return mem(instruction.MemoryFill{MemIdx: uint32(memIdx)}), nil
+		return mem(instruction.MemoryFill{}), nil
 
 	case instruction.ExtOpTableInit:
 		elemIdx, err := r.ReadU32()
@@ -869,11 +850,11 @@ func parseBlockType(r *Reader) (types.BlockType, error) {
 	}
 
 	// Type index (s33 encoded)
-	typeIdx, err := r.ReadI32()
+	typeIdx, err := r.ReadS33()
 	if err != nil {
 		return types.BlockType{}, err
 	}
-	if typeIdx < 0 {
+	if typeIdx < 0 || typeIdx > math.MaxUint32 {
 		return types.BlockType{}, ErrInvalidBlockType
 	}
 
@@ -894,6 +875,9 @@ func parseBlockBody(r *Reader) ([]instruction.Instruction, error) {
 
 		if result.isEnd {
 			break
+		}
+		if result.isElse {
+			return nil, fmt.Errorf("%w: else outside if", ErrInvalidOpcode)
 		}
 
 		body = append(body, result.instr)
@@ -933,11 +917,39 @@ func parseMemArg(r *Reader) (instruction.MemArg, error) {
 	if err != nil {
 		return instruction.MemArg{}, err
 	}
+	if align >= 32 {
+		return instruction.MemArg{}, fmt.Errorf("%w: malformed memop flags", ErrInvalidOpcode)
+	}
 	offset, err := r.ReadU32()
 	if err != nil {
 		return instruction.MemArg{}, err
 	}
 	return instruction.MemArg{Align: align, Offset: offset}, nil
+}
+
+// readZeroByte reads the reserved memory-index byte, which is 0 in a
+// single-memory module.
+func readZeroByte(r *Reader) error {
+	b, err := r.ReadByte()
+	if err != nil {
+		return err
+	}
+	if b != 0 {
+		return fmt.Errorf("%w: zero byte expected", ErrInvalidOpcode)
+	}
+	return nil
+}
+
+// readRefType reads funcref or externref.
+func readRefType(r *Reader) (types.ValueType, error) {
+	b, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	if t := types.ValueType(b); t == types.FuncRef || t == types.ExternRef {
+		return t, nil
+	}
+	return 0, fmt.Errorf("%w: malformed reference type 0x%02x", ErrInvalidType, b)
 }
 
 // Wrapper helpers for category types

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/t14raptor/go-fwasm/instruction"
 	"github.com/t14raptor/go-fwasm/module"
@@ -29,11 +30,21 @@ func Parse(data []byte) (*module.Module, error) {
 
 	mod := &module.Module{}
 
-	// Read sections
+	// Read sections. Non-custom sections appear at most once, in order.
+	lastRank := 0
 	for !r.EOF() {
 		sectionID, err := r.ReadByte()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read section ID: %w", err)
+		}
+		if sectionID > byte(types.SectionDataCount) {
+			return nil, fmt.Errorf("%w: malformed section id %d", ErrInvalidSection, sectionID)
+		}
+		if rank := sectionRank[sectionID]; rank != 0 {
+			if rank <= lastRank {
+				return nil, fmt.Errorf("%w: section %s", ErrSectionOrder, types.SectionID(sectionID))
+			}
+			lastRank = rank
 		}
 
 		sectionSize, err := r.ReadU32()
@@ -49,9 +60,38 @@ func Parse(data []byte) (*module.Module, error) {
 		if err := parseSection(mod, types.SectionID(sectionID), sectionReader); err != nil {
 			return nil, fmt.Errorf("failed to parse section %s: %w", types.SectionID(sectionID), err)
 		}
+		if !sectionReader.EOF() {
+			return nil, fmt.Errorf("%w: section %s", ErrSectionSize, types.SectionID(sectionID))
+		}
+		if sectionReader.usesDataIdx && mod.DataCount == nil {
+			return nil, fmt.Errorf("%w: data count section required", ErrMalformedSection)
+		}
 	}
 
+	if len(mod.Functions) != len(mod.Codes) {
+		return nil, fmt.Errorf("%w: function and code section have inconsistent lengths", ErrMalformedSection)
+	}
+	if mod.DataCount != nil && int(*mod.DataCount) != len(mod.Datas) {
+		return nil, fmt.Errorf("%w: data count and data section have inconsistent lengths", ErrMalformedSection)
+	}
 	return mod, nil
+}
+
+// sectionRank orders the non-custom sections. The data count section sits
+// between the element and code sections.
+var sectionRank = [...]int{
+	types.SectionType:      1,
+	types.SectionImport:    2,
+	types.SectionFunction:  3,
+	types.SectionTable:     4,
+	types.SectionMemory:    5,
+	types.SectionGlobal:    6,
+	types.SectionExport:    7,
+	types.SectionStart:     8,
+	types.SectionElement:   9,
+	types.SectionDataCount: 10,
+	types.SectionCode:      11,
+	types.SectionData:      12,
 }
 
 func readU32LE(r *Reader) (uint32, error) {
@@ -281,6 +321,9 @@ func parseLimits(r *Reader) (types.Limits, error) {
 		return types.Limits{}, err
 	}
 
+	if flags > 1 {
+		return types.Limits{}, fmt.Errorf("%w: limits flag 0x%02x", ErrIntegerOverflow, flags)
+	}
 	limits := types.Limits{Min: min, HasMax: flags&0x01 != 0}
 	if limits.HasMax {
 		max, err := r.ReadU32()
@@ -301,6 +344,9 @@ func parseGlobalType(r *Reader) (types.GlobalType, error) {
 	mut, err := r.ReadByte()
 	if err != nil {
 		return types.GlobalType{}, err
+	}
+	if mut > 1 {
+		return types.GlobalType{}, fmt.Errorf("%w: malformed mutability 0x%02x", ErrInvalidType, mut)
 	}
 
 	return types.GlobalType{
@@ -476,8 +522,7 @@ func parseElement(r *Reader) (module.Element, error) {
 	case 1:
 		// Passive, elemkind, vec of funcidx
 		elem.Mode = module.ElementModePassive
-		_, err := r.ReadByte() // elemkind (0x00 = funcref)
-		if err != nil {
+		if err := readElemKind(r); err != nil {
 			return module.Element{}, err
 		}
 		funcIdxs, err := parseFuncIdxVec(r)
@@ -499,8 +544,7 @@ func parseElement(r *Reader) (module.Element, error) {
 			return module.Element{}, err
 		}
 		elem.Offset = offset
-		_, err = r.ReadByte() // elemkind
-		if err != nil {
+		if err := readElemKind(r); err != nil {
 			return module.Element{}, err
 		}
 		funcIdxs, err := parseFuncIdxVec(r)
@@ -512,8 +556,7 @@ func parseElement(r *Reader) (module.Element, error) {
 	case 3:
 		// Declarative, elemkind, vec of funcidx
 		elem.Mode = module.ElementModeDeclarative
-		_, err := r.ReadByte() // elemkind
-		if err != nil {
+		if err := readElemKind(r); err != nil {
 			return module.Element{}, err
 		}
 		funcIdxs, err := parseFuncIdxVec(r)
@@ -540,11 +583,11 @@ func parseElement(r *Reader) (module.Element, error) {
 	case 5:
 		// Passive, reftype, vec of expr
 		elem.Mode = module.ElementModePassive
-		refType, err := r.ReadByte()
+		refType, err := readRefType(r)
 		if err != nil {
 			return module.Element{}, err
 		}
-		elem.Type = types.ValueType(refType)
+		elem.Type = refType
 		exprs, err := parseExprVec(r)
 		if err != nil {
 			return module.Element{}, err
@@ -564,11 +607,11 @@ func parseElement(r *Reader) (module.Element, error) {
 			return module.Element{}, err
 		}
 		elem.Offset = offset
-		refType, err := r.ReadByte()
+		refType, err := readRefType(r)
 		if err != nil {
 			return module.Element{}, err
 		}
-		elem.Type = types.ValueType(refType)
+		elem.Type = refType
 		exprs, err := parseExprVec(r)
 		if err != nil {
 			return module.Element{}, err
@@ -578,11 +621,11 @@ func parseElement(r *Reader) (module.Element, error) {
 	case 7:
 		// Declarative, reftype, vec of expr
 		elem.Mode = module.ElementModeDeclarative
-		refType, err := r.ReadByte()
+		refType, err := readRefType(r)
 		if err != nil {
 			return module.Element{}, err
 		}
-		elem.Type = types.ValueType(refType)
+		elem.Type = refType
 		exprs, err := parseExprVec(r)
 		if err != nil {
 			return module.Element{}, err
@@ -594,6 +637,18 @@ func parseElement(r *Reader) (module.Element, error) {
 	}
 
 	return elem, nil
+}
+
+// readElemKind reads an element kind, of which 0x00 (funcref) is the only one.
+func readElemKind(r *Reader) error {
+	kind, err := r.ReadByte()
+	if err != nil {
+		return err
+	}
+	if kind != 0x00 {
+		return fmt.Errorf("%w: malformed element kind 0x%02x", ErrInvalidType, kind)
+	}
+	return nil
 }
 
 func parseFuncIdxVec(r *Reader) ([]uint32, error) {
@@ -633,7 +688,7 @@ func parseExprVec(r *Reader) ([][]instruction.Instruction, error) {
 func funcIdxsToExprs(funcIdxs []uint32) [][]instruction.Instruction {
 	result := make([][]instruction.Instruction, len(funcIdxs))
 	for i, idx := range funcIdxs {
-		result[i] = []instruction.Instruction{instruction.RefFunc{FuncIdx: idx}}
+		result[i] = []instruction.Instruction{instruction.Reference{Instr: instruction.RefFunc{FuncIdx: idx}}}
 	}
 	return result
 }
@@ -674,10 +729,14 @@ func parseCode(r *Reader) (module.Code, error) {
 	}
 
 	locals := make([]module.Local, localCount)
+	var total uint64
 	for i := uint32(0); i < localCount; i++ {
 		count, err := codeReader.ReadU32()
 		if err != nil {
 			return module.Code{}, err
+		}
+		if total += uint64(count); total > math.MaxUint32 {
+			return module.Code{}, fmt.Errorf("%w: too many locals", ErrMalformedSection)
 		}
 		valType, err := codeReader.ReadByte()
 		if err != nil {
@@ -689,11 +748,15 @@ func parseCode(r *Reader) (module.Code, error) {
 		}
 	}
 
-	// Parse the function body
-	body, err := parseInstructions(codeReader)
+	// The body is one expression whose end is the last byte.
+	body, err := parseExpression(codeReader)
 	if err != nil {
 		return module.Code{}, err
 	}
+	if !codeReader.EOF() {
+		return module.Code{}, ErrEndExpected
+	}
+	r.usesDataIdx = r.usesDataIdx || codeReader.usesDataIdx
 
 	return module.Code{
 		Locals: locals,

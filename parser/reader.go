@@ -2,11 +2,15 @@ package parser
 
 import (
 	"math"
+	"unicode/utf8"
 )
 
 type Reader struct {
 	data   []byte
 	offset int
+	// usesDataIdx records a memory.init or data.drop, which need the data
+	// count section.
+	usesDataIdx bool
 }
 
 func NewReader(data []byte) *Reader {
@@ -51,107 +55,81 @@ func (r *Reader) PeekByte() (byte, error) {
 }
 
 func (r *Reader) ReadU32() (uint32, error) {
-	var result uint32
-	var shift uint
-
-	for {
-		if r.offset >= len(r.data) {
-			return 0, ErrUnexpectedEOF
-		}
-		b := r.data[r.offset]
-		r.offset++
-
-		result |= uint32(b&0x7F) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-		if shift >= 35 {
-			return 0, ErrIntegerOverflow
-		}
-	}
-
-	return result, nil
+	v, err := r.readUnsigned(32)
+	return uint32(v), err
 }
 
 func (r *Reader) ReadU64() (uint64, error) {
-	var result uint64
-	var shift uint
-
-	for {
-		if r.offset >= len(r.data) {
-			return 0, ErrUnexpectedEOF
-		}
-		b := r.data[r.offset]
-		r.offset++
-
-		result |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-		if shift >= 70 {
-			return 0, ErrIntegerOverflow
-		}
-	}
-
-	return result, nil
+	return r.readUnsigned(64)
 }
 
 func (r *Reader) ReadI32() (int32, error) {
-	var result int32
-	var shift uint
-
-	for {
-		if r.offset >= len(r.data) {
-			return 0, ErrUnexpectedEOF
-		}
-		b := r.data[r.offset]
-		r.offset++
-
-		result |= int32(b&0x7F) << shift
-		shift += 7
-
-		if b&0x80 == 0 {
-			if shift < 32 && (b&0x40) != 0 {
-				result |= ^int32(0) << shift
-			}
-			break
-		}
-		if shift >= 35 {
-			return 0, ErrIntegerOverflow
-		}
-	}
-
-	return result, nil
+	v, err := r.readSigned(32)
+	return int32(v), err
 }
 
 func (r *Reader) ReadI64() (int64, error) {
-	var result int64
-	var shift uint
+	return r.readSigned(64)
+}
 
-	for {
-		if r.offset >= len(r.data) {
-			return 0, ErrUnexpectedEOF
+// ReadS33 reads the signed 33-bit LEB128 used for block type indices.
+func (r *Reader) ReadS33() (int64, error) {
+	return r.readSigned(33)
+}
+
+// readUnsigned decodes an unsigned LEB128 of at most ceil(bits/7) bytes
+// whose unused high bits are zero.
+func (r *Reader) readUnsigned(bits uint) (uint64, error) {
+	var result uint64
+	for shift := uint(0); ; shift += 7 {
+		b, err := r.ReadByte()
+		if err != nil {
+			return 0, err
 		}
-		b := r.data[r.offset]
-		r.offset++
-
-		result |= int64(b&0x7F) << shift
-		shift += 7
-
-		if b&0x80 == 0 {
-			if shift < 64 && (b&0x40) != 0 {
-				result |= ^int64(0) << shift
-			}
-			break
+		last := shift+7 >= bits
+		if last && b&0x80 != 0 {
+			return 0, ErrIntegerTooLong
 		}
-		if shift >= 70 {
+		if last && uint64(b&0x7f)>>(bits-shift) != 0 {
 			return 0, ErrIntegerOverflow
 		}
+		result |= uint64(b&0x7f) << shift
+		if b&0x80 == 0 {
+			return result, nil
+		}
 	}
+}
 
-	return result, nil
+// readSigned decodes a signed LEB128 of at most ceil(bits/7) bytes whose
+// unused high bits repeat the sign bit.
+func (r *Reader) readSigned(bits uint) (int64, error) {
+	var result int64
+	var shift uint
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		last := shift+7 >= bits
+		if last && b&0x80 != 0 {
+			return 0, ErrIntegerTooLong
+		}
+		if last {
+			// The sign bit and every unused bit above it must agree.
+			high := (b & 0x7f) >> (bits - shift - 1)
+			if high != 0 && high != 0x7f>>(bits-shift-1) {
+				return 0, ErrIntegerOverflow
+			}
+		}
+		result |= int64(b&0x7f) << shift
+		shift += 7
+		if b&0x80 == 0 {
+			if shift < 64 && b&0x40 != 0 {
+				result |= -1 << shift
+			}
+			return result, nil
+		}
+	}
 }
 
 func (r *Reader) ReadF32() (float32, error) {
@@ -192,6 +170,9 @@ func (r *Reader) ReadName() (string, error) {
 	bytes, err := r.ReadBytes(int(length))
 	if err != nil {
 		return "", err
+	}
+	if !utf8.Valid(bytes) {
+		return "", ErrMalformedUTF8
 	}
 	return string(bytes), nil
 }
